@@ -1,0 +1,8 @@
+# dsh-model-badges bundle patch.
+#
+# 一行 insert 即挂载 Host 半身（服务端 index.js）；浏览器半身由
+# package.json 的 dsh.client 声明，web app 自动加载 ./client。
+- insert:
+    - id: model-badges
+      name: 'dsh-model-badges'
+      config: {}
