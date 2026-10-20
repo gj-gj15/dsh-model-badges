@@ -67,7 +67,7 @@ export function apply(ctx, config) {
     }
   }
 
-  // ── 模型清单：网关 /v1/models 全量 + 插件 catalog 补充 ─────────────────────
+  // ── 模型清单：免费模型优先 our-free-model 前缀，其他通道用网关全量 ────────
   // 返回 { catalog: [{ id, aliases, model }], models: [model, ...] }
   // - id:      角标匹配主 ID（即可调用的完整模型 ID）
   // - aliases: 该模型在选单里可能出现的其他 data-model-id（含简写）
@@ -85,8 +85,40 @@ export function apply(ctx, config) {
       if (alias) entry.aliases.add(alias)
     }
 
-    // 1) 网关全量模型（主清单，覆盖所有选单通道）
-    const gwByShort = new Map() // 简写 -> [完整ID, ...]
+    const freeShort = new Set()   // 免费模型简写（如 big-pickle）
+    const freeModels = new Set()  // 免费模型完整 ID（our-free-model/xxx）
+
+    // 1) 优先加载两个免费插件 catalog，统一用 our-free-model/ 前缀（实测可调用）
+    for (const dir of [OFM_DIR, OPENCODE_DIR]) {
+      try {
+        const cat = JSON.parse(fs.readFileSync(path.join(dir, 'catalog.json'), 'utf8'))
+        for (const e of cat.entries ?? []) {
+          if (typeof e === 'string' && e) {
+            freeShort.add(e)
+            freeModels.add(`our-free-model/${e}`)
+          }
+        }
+        for (const e of cat.sealIds ?? []) {
+          if (typeof e === 'string' && e) {
+            freeShort.add(e)
+            freeModels.add(`our-free-model/${e}`)
+          }
+        }
+        for (const k of cat.kiloRows ?? []) {
+          if (k && typeof k.id === 'string' && k.id) {
+            freeShort.add(k.id)
+            freeModels.add(`our-free-model/${k.id}`)
+          }
+        }
+      } catch { /* ignore catalog */ }
+    }
+
+    for (const id of freeModels) {
+      const short = id.slice('our-free-model/'.length)
+      addModel(id, short)
+    }
+
+    // 2) 网关其他通道模型（排除免费模型重复项，避免 404 别名）
     try {
       const key = loadApiKey()
       const resp = await fetch(`${GATEWAY}/v1/models`, {
@@ -97,48 +129,18 @@ export function apply(ctx, config) {
         for (const m of data.data ?? []) {
           const id = String(m.id ?? '').trim()
           if (!id || id.includes('/v1/')) continue
-          addModel(id, id)
+          // 跳过已是免费模型的 ID 及其代理别名（如 opencode-free-model/big-pickle、opencode2dsh/big-pickle）
+          if (freeModels.has(id)) continue
+          if (id.startsWith('our-free-model/') || id.startsWith('modlens-our-free-model/')) continue
           const slash = id.indexOf('/')
-          if (slash > 0 && slash < id.length - 1) {
-            const short = id.slice(slash + 1)
-            addModel(id, short)
-            if (!gwByShort.has(short)) gwByShort.set(short, [])
-            gwByShort.get(short).push(id)
-          }
+          const short = slash > 0 ? id.slice(slash + 1) : id
+          if (freeShort.has(short)) continue
+          // 其他通道模型（buddy/codearts/deepseek-account 等）保留
+          addModel(id, id)
+          if (slash > 0 && slash < id.length - 1) addModel(id, short)
         }
       }
-    } catch { /* gateway may be down; fall back to catalogs */ }
-
-    // 2) 插件 catalog 补充（our-free-model / opencode-free-model 的简写与直写 ID）
-    const ensureAliasOnGateway = (short, alias) => {
-      const gwIds = gwByShort.get(short)
-      if (gwIds && gwIds.length > 0) {
-        for (const gid of gwIds) addModel(gid, alias)
-        return true
-      }
-      return false
-    }
-
-    for (const dir of [OFM_DIR, OPENCODE_DIR]) {
-      try {
-        const cat = JSON.parse(fs.readFileSync(path.join(dir, 'catalog.json'), 'utf8'))
-        for (const e of cat.entries ?? []) {
-          if (typeof e === 'string' && e) {
-            if (!ensureAliasOnGateway(e, e)) addModel(`our-free-model/${e}`, e)
-          }
-        }
-        for (const e of cat.sealIds ?? []) {
-          if (typeof e === 'string' && e) {
-            if (!ensureAliasOnGateway(e, e)) addModel(`our-free-model/${e}`, e)
-          }
-        }
-        for (const k of cat.kiloRows ?? []) {
-          if (k && typeof k.id === 'string' && k.id) {
-            if (!ensureAliasOnGateway(k.id, k.id)) addModel(`our-free-model/${k.id}`, k.id)
-          }
-        }
-      } catch { /* ignore catalog */ }
-    }
+    } catch { /* gateway may be down */ }
 
     const catalog = [...byModel.values()]
       .map(entry => ({ id: entry.id, aliases: [...entry.aliases].sort(), model: entry.model }))
@@ -236,6 +238,11 @@ export function apply(ctx, config) {
     logger.info?.(`model-badges: auto bench starting with ${models.length} models`)
     const perf = loadPerfBadges()
     const badges = perf.badges ?? {}
+    // 以当前目录为准：清掉已不在模型清单中的旧条目，避免残留错误别名
+    const modelSet = new Set(models)
+    for (const key of Object.keys(badges)) {
+      if (!modelSet.has(key)) delete badges[key]
+    }
     let cursor = 0
     const worker = async () => {
       while (cursor < models.length) {
@@ -277,6 +284,7 @@ export function apply(ctx, config) {
         if (!done && attempts < 6) setTimeout(tryBench, 30000).unref?.()
       }).catch(() => {})
     }
+    // 启动 15 秒后自动测速：尽快刷新角标
     setTimeout(tryBench, 15000).unref?.()
   }
 
