@@ -2,7 +2,8 @@
  * dsh-model-badges — 浏览器端。
  *
  * 贡献：
- *   1. 对话输入框模型快速选单的彩色角标（[data-model-id]::after，绿=快·稳/黄=中/红=不可用）；
+ *   1. 对话输入框模型快速选单的彩色角标（[data-model-id]::after，绿=快·稳/黄=中/红=不可用），
+ *      覆盖网关全量模型（完整 ID + 简写别名）。
  *   2. 设置页「模型体检」section：评级统计、模型评级表、「立即重新测试」按钮。
  *
  * 数据来自插件自己的 /api/model-badges/* 路由（同源），不依赖其他插件。
@@ -28,7 +29,7 @@ window.__ModuleLoader__.load({
         'red': '不可用',
         'rerun': '立即重新测试',
         'running': '测试中…',
-        'benchStarted': '已开始后台基准测试，约 40 秒后自动刷新',
+        'benchStarted': '已开始后台基准测试，全部模型测完约需几分钟，页面会定时刷新',
         'colModel': '模型 ID',
         'colRating': '评级',
         'colNote': '说明',
@@ -37,14 +38,14 @@ window.__ModuleLoader__.load({
       },
       en: {
         'nav': 'Model Badges',
-        'title': 'Free Model Speed Badges',
+        'title': 'Model Speed Badges',
         'sub': 'Last run: {at} · auto re-bench 15s after each dsh start',
         'green': 'Fast',
         'yellow': 'Slow',
         'red': 'Unavailable',
         'rerun': 'Re-bench now',
         'running': 'Running…',
-        'benchStarted': 'Bench started, will refresh in ~40s',
+        'benchStarted': 'Bench started, will refresh automatically in a few minutes',
         'colModel': 'Model',
         'colRating': 'Rating',
         'colNote': 'Note',
@@ -101,7 +102,7 @@ window.__ModuleLoader__.load({
 .mb-refresh{float:right}
 `
 
-    // 快速选单角标 CSS：data-model-id 属性选择器
+    // 快速选单角标 CSS：data-model-id 属性选择器（完整 ID + 简写别名）
     function perfCssFor(catalog) {
       const rules = (catalog ?? [])
         .filter(entry => entry?.perf !== undefined && typeof entry.perf.label === 'string' && typeof entry.perf.level === 'string')
@@ -110,8 +111,11 @@ window.__ModuleLoader__.load({
           const color = level === 'green' ? '#0e9f6e' : level === 'yellow' ? '#b45309' : '#c81e1e'
           const bg = level === 'green' ? '#e6f7f0' : level === 'yellow' ? '#fdf0dc' : '#fdeaea'
           const border = level === 'green' ? '#b7e4d2' : level === 'yellow' ? '#f2d9a6' : '#f0b9b9'
-          const id = entry.id
-          return `[data-model-id="${id}"]::after,[data-model-id="our-free-model/${id}"]::after{content:"${entry.perf.label}";display:inline-block;margin-left:6px;padding:1px 7px;border-radius:999px;font-size:10px;font-weight:700;color:${color};background:${bg};border:1px solid ${border}}`
+          const selectors = [entry.id, ...(entry.aliases ?? [])]
+            .filter(Boolean)
+            .map(id => `[data-model-id="${id}"]::after`)
+            .join(',')
+          return `${selectors}{content:"${entry.perf.label}";display:inline-block;margin-left:6px;padding:1px 7px;border-radius:999px;font-size:10px;font-weight:700;color:${color};background:${bg};border:1px solid ${border}}`
         })
       return rules.join('\n')
     }
