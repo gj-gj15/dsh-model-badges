@@ -2,8 +2,9 @@
  * dsh-model-badges — 大模型选单实测速度角标（独立插件，不依赖外部脚本）。
  *
  * 功能：
- *   1. dsh 启动 15 秒后自动跑一轮轻量基准测试（读取 ~/.dsh/our-free-model/catalog.json
- *      的模型清单，通过本地 OpenAI 网关 8326 实测 TTFT/成功率）。
+ *   1. dsh 启动 15 秒后自动跑一轮轻量基准测试：模型清单来自本地 OpenAI 网关
+ *      /v1/models 的「全量模型」+ our-free-model / opencode-free-model 插件
+ *      catalog 补充，覆盖 dsh 大模型选单里的所有模型通道。
  *   2. 评级写入 ~/.dsh/model-badges/perf-badges.json（绿=快·稳 / 黄=中 / 红=不可用）。
  *   3. 提供 /api/model-badges/* 路由：GET /summary 返回评级+目录；POST /bench 手动重测。
  *   4. 浏览器端 client.js 拉取 /summary 动态生成快速选单彩色角标与设置页评级表。
@@ -16,7 +17,7 @@ import path from 'node:path'
 import fs from 'node:fs'
 
 export const name = 'model-badges'
-export const version = '1.0.0'
+export const version = '1.1.0'
 export const inject = []
 
 const GATEWAY = 'http://127.0.0.1:8326'
@@ -26,6 +27,7 @@ export function apply(ctx, config) {
   const home = process.env.USERPROFILE || os.homedir()
   const DATA_DIR = path.join(home, '.dsh', 'model-badges')
   const OFM_DIR = path.join(home, '.dsh', 'our-free-model')
+  const OPENCODE_DIR = path.join(home, '.dsh', 'opencode-free-model')
   const API_KEY_PATH = path.join(home, '.dsh', 'openai-gateway', 'api-key')
 
   fs.mkdirSync(DATA_DIR, { recursive: true })
@@ -42,45 +44,19 @@ export function apply(ctx, config) {
   const savePerfBadges = data => {
     try {
       fs.writeFileSync(badgesFile(), JSON.stringify(data, null, 2), 'utf8')
-      // 镜像到 our-free-model 的 perf-badges.json：让 dsh 选单角标直接使用本插件评级。
-      // 这是 best-effort：即使 our-free-model 目录不存在/不可写，也不影响本插件自身数据。
-      try {
-        const mirrorPath = path.join(home, '.dsh', 'our-free-model', 'perf-badges.json')
-        fs.mkdirSync(path.dirname(mirrorPath), { recursive: true })
-        fs.writeFileSync(mirrorPath, JSON.stringify(data, null, 2), 'utf8')
-      } catch { /* mirror is best-effort */ }
+      // 镜像到各插件目录：让 dsh 既有选单角标也能直接使用本插件评级。
+      for (const dir of [OFM_DIR, OPENCODE_DIR]) {
+        try {
+          const mirrorPath = path.join(dir, 'perf-badges.json')
+          fs.mkdirSync(path.dirname(mirrorPath), { recursive: true })
+          fs.writeFileSync(mirrorPath, JSON.stringify(data, null, 2), 'utf8')
+        } catch { /* mirror is best-effort */ }
+      }
       return true
     } catch (err) {
       logger.warn?.(`model-badges: failed to write badges: ${err?.message ?? err}`)
       return false
     }
-  }
-
-  // ── 模型清单：优先 our-free-model 的 catalog；不存在则回退网关 /v1/models ──
-  const loadCatalog = async () => {
-    try {
-      const cat = JSON.parse(fs.readFileSync(path.join(OFM_DIR, 'catalog.json'), 'utf8'))
-      const ids = new Set()
-      for (const e of cat.entries ?? []) ids.add(e)
-      for (const e of cat.sealIds ?? []) ids.add(e)
-      for (const k of cat.kiloRows ?? []) ids.add(k.id)
-      if (ids.size > 0) return [...ids].sort()
-    } catch { /* fall through */ }
-    // 回退：从网关模型列表推导简写 ID（our-free-model/ 前缀）
-    try {
-      const key = loadApiKey()
-      const resp = await fetch(`${GATEWAY}/v1/models`, { headers: { Authorization: `Bearer ${key}` } })
-      if (resp.ok) {
-        const data = await resp.json()
-        const ids = (data.data ?? [])
-          .map(m => String(m.id ?? ''))
-          .filter(id => id.startsWith('our-free-model/'))
-          .map(id => id.slice('our-free-model/'.length))
-          .filter(id => id.length > 0 && !id.includes('/v1/'))
-        return [...new Set(ids)].sort()
-      }
-    } catch { /* ignore */ }
-    return []
   }
 
   const loadApiKey = () => {
@@ -89,6 +65,85 @@ export function apply(ctx, config) {
     } catch {
       return ''
     }
+  }
+
+  // ── 模型清单：网关 /v1/models 全量 + 插件 catalog 补充 ─────────────────────
+  // 返回 { catalog: [{ id, aliases, model }], models: [model, ...] }
+  // - id:      角标匹配主 ID（即可调用的完整模型 ID）
+  // - aliases: 该模型在选单里可能出现的其他 data-model-id（含简写）
+  // - model:   测速请求使用的 model 参数（与 id 相同）
+  const loadModelCatalog = async () => {
+    const byModel = new Map() // model -> { id, aliases: Set, model }
+
+    const addModel = (model, alias) => {
+      if (!model) return
+      let entry = byModel.get(model)
+      if (!entry) {
+        entry = { id: model, aliases: new Set(), model }
+        byModel.set(model, entry)
+      }
+      if (alias) entry.aliases.add(alias)
+    }
+
+    // 1) 网关全量模型（主清单，覆盖所有选单通道）
+    const gwByShort = new Map() // 简写 -> [完整ID, ...]
+    try {
+      const key = loadApiKey()
+      const resp = await fetch(`${GATEWAY}/v1/models`, {
+        headers: { Authorization: `Bearer ${key}` },
+      })
+      if (resp.ok) {
+        const data = await resp.json()
+        for (const m of data.data ?? []) {
+          const id = String(m.id ?? '').trim()
+          if (!id || id.includes('/v1/')) continue
+          addModel(id, id)
+          const slash = id.indexOf('/')
+          if (slash > 0 && slash < id.length - 1) {
+            const short = id.slice(slash + 1)
+            addModel(id, short)
+            if (!gwByShort.has(short)) gwByShort.set(short, [])
+            gwByShort.get(short).push(id)
+          }
+        }
+      }
+    } catch { /* gateway may be down; fall back to catalogs */ }
+
+    // 2) 插件 catalog 补充（our-free-model / opencode-free-model 的简写与直写 ID）
+    const ensureAliasOnGateway = (short, alias) => {
+      const gwIds = gwByShort.get(short)
+      if (gwIds && gwIds.length > 0) {
+        for (const gid of gwIds) addModel(gid, alias)
+        return true
+      }
+      return false
+    }
+
+    for (const dir of [OFM_DIR, OPENCODE_DIR]) {
+      try {
+        const cat = JSON.parse(fs.readFileSync(path.join(dir, 'catalog.json'), 'utf8'))
+        for (const e of cat.entries ?? []) {
+          if (typeof e === 'string' && e) {
+            if (!ensureAliasOnGateway(e, e)) addModel(`our-free-model/${e}`, e)
+          }
+        }
+        for (const e of cat.sealIds ?? []) {
+          if (typeof e === 'string' && e) {
+            if (!ensureAliasOnGateway(e, e)) addModel(`our-free-model/${e}`, e)
+          }
+        }
+        for (const k of cat.kiloRows ?? []) {
+          if (k && typeof k.id === 'string' && k.id) {
+            if (!ensureAliasOnGateway(k.id, k.id)) addModel(`our-free-model/${k.id}`, k.id)
+          }
+        }
+      } catch { /* ignore catalog */ }
+    }
+
+    const catalog = [...byModel.values()]
+      .map(entry => ({ id: entry.id, aliases: [...entry.aliases].sort(), model: entry.model }))
+      .sort((a, b) => a.id.localeCompare(b.id))
+    return { catalog, models: catalog.map(entry => entry.model) }
   }
 
   // ── 评级规则 ──────────────────────────────────────────────────────────────
@@ -101,11 +156,11 @@ export function apply(ctx, config) {
   const badgeLabelFor = level => level === 'green' ? '快·稳' : level === 'yellow' ? '中' : '不可用'
 
   // ── 单模型探测（HTTP 流式，测 TTFT）───────────────────────────────────────
-  const probeModelOnce = async (modelId, timeoutMs = 40000) => {
+  const probeModelOnce = async (modelId, timeoutMs = 35000) => {
     const key = loadApiKey()
     if (!key) return { ok: false, ttftMs: 0, error: 'no api key' }
     const body = JSON.stringify({
-      model: `our-free-model/${modelId}`,
+      model: modelId,
       messages: [{ role: 'user', content: 'Reply with exactly: OK' }],
       stream: true,
       max_tokens: 16,
@@ -173,21 +228,21 @@ export function apply(ctx, config) {
 
   // ── 自动基准测试（6 并发，滚动保留每模型 10 条样本）────────────────────────
   const runAutoBench = async () => {
-    const catalog = await loadCatalog()
-    if (catalog.length === 0) {
+    const { catalog, models } = await loadModelCatalog()
+    if (models.length === 0) {
       logger.warn?.('model-badges: no models in catalog, skip auto bench')
       return true
     }
-    logger.info?.(`model-badges: auto bench starting with ${catalog.length} models`)
+    logger.info?.(`model-badges: auto bench starting with ${models.length} models`)
     const perf = loadPerfBadges()
     const badges = perf.badges ?? {}
     let cursor = 0
     const worker = async () => {
-      while (cursor < catalog.length) {
-        const id = catalog[cursor++]
-        const existing = badges[id] ?? {}
+      while (cursor < models.length) {
+        const model = models[cursor++]
+        const existing = badges[model] ?? {}
         const samples = Array.isArray(existing.samples) ? existing.samples.slice() : []
-        const result = await probeModelOnce(id)
+        const result = await probeModelOnce(model)
         samples.push({ at: Date.now(), ok: result.ok, ttftMs: result.ok ? result.ttftMs : undefined })
         while (samples.length > 10) samples.shift()
         const okCount = samples.filter(s => s.ok).length
@@ -197,7 +252,7 @@ export function apply(ctx, config) {
           ? okSamples.reduce((sum, s) => sum + (s.ttftMs ?? 0), 0) / okSamples.length
           : 0
         const level = badgeLevelFor(rate, ttftAvg)
-        badges[id] = {
+        badges[model] = {
           level,
           label: badgeLabelFor(level),
           note: `自动评测：${samples.length} 次样本，成功率 ${Math.round(rate * 100)}%，平均 TTFT ${Math.round(ttftAvg)}ms${result.ok ? '' : `；最近失败: ${result.error ?? 'unknown'}`}`,
@@ -228,16 +283,17 @@ export function apply(ctx, config) {
   // ── API 路由 ───────────────────────────────────────────────────────────────
   const buildSummary = async () => {
     const perf = loadPerfBadges()
-    const catalog = await loadCatalog()
+    const { catalog } = await loadModelCatalog()
     return {
       version: 1,
       at: perf.at ?? 0,
       source: perf.source ?? '',
       badges: perf.badges ?? {},
-      catalog: catalog.map(id => {
-        const p = (perf.badges ?? {})[id]
+      catalog: catalog.map(entry => {
+        const p = (perf.badges ?? {})[entry.model]
         return {
-          id,
+          id: entry.id,
+          aliases: entry.aliases,
           perf: p === undefined ? undefined : { level: p.level, label: p.label, note: p.note },
         }
       }),
