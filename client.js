@@ -9,7 +9,7 @@
  * 数据来自插件自己的 /api/model-badges/* 路由（同源），不依赖其他插件。
  */
 window.__ModuleLoader__.load({
-  id: 'model-badges',
+  id: 'dsh-model-badges',
   factory: require => {
     const module = { exports: {} }
     const exports = module.exports
