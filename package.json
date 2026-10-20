@@ -1,9 +1,9 @@
 {
   "name": "dsh-model-badges",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
-  "description": "dsh 大模型选单实测速度角标：每次启动自动跑一轮基准测试，给快速选单/设置页标注 🟢快·稳 / 🟡中 / 🔴不可用。完全独立运行，不依赖外部脚本。",
+  "description": "dsh 大模型选单实测速度角标：每次启动自动跑一轮基准测试，覆盖全量模型选单，给快速选单/设置页标注 🟢快·稳 / 🟡中 / 🔴不可用。完全独立运行，不依赖外部脚本。",
   "main": "./index.js",
   "exports": {
     ".": "./index.js",
