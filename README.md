@@ -23,7 +23,7 @@
 在 dsh 设置 → 插件 → **添加插件**，输入本仓库地址：
 
 ```
-https://github.com/<your-name>/dsh-model-badges
+https://github.com/gj-gj15/dsh-model-badges
 ```
 
 安装后点击「立即启用」，重启 dsh 生效。
